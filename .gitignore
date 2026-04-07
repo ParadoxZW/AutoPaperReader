@@ -1,0 +1,12 @@
+# macOS
+.DS_Store
+
+# Local agent/runtime artifacts
+.claude/settings.local.json
+
+# Concrete paper outputs
+docs/*.md
+!docs/.gitkeep
+
+sources/*
+!sources/.gitkeep
