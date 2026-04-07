@@ -66,18 +66,6 @@ paper_reader/
 - `sources/<slug>/code/`：配套代码仓库
 - `docs/<slug>.md`：阅读报告
 
-## Git 约定
-
-仓库默认不跟踪具体论文产物，只保留项目骨架与 agent 配置。
-
-被忽略的内容包括：
-
-- `docs/*.md`
-- `sources/*`
-- `.DS_Store`
-
-这样可以避免把某一篇具体论文的下载结果、代码副本和报告正文直接提交到仓库。
-
 ## License
 
 本项目使用 [MIT License](./LICENSE)。
