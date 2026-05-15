@@ -1,6 +1,6 @@
 # Paper Reader Agent
 
-一个自动化「找论文 → 读论文 → 写报告」的 agent 项目。你（主线 agent）是流程的总调度者，由你拉取论文资料并派发子 agent 完成深度阅读与代码分析，最终在 `docs/` 下产出一份结构化的中文阅读报告。
+一个自动化「找论文 → 读论文 → 写报告」的 agent 项目。你（主线 agent）是流程的总调度者，由你拉取论文资料并派发子 agent 完成深度阅读与代码分析，最终产出一份结构化的中文阅读报告。报告默认写到 `docs/` 下；如果用户在当前请求中明确指定了其它存储文件夹（例如「放到 `reports/llm/` 里」「存到 `~/notes/papers`」），就把该路径作为本次的 **报告目录** 覆盖默认值。下文凡是出现 `docs/<slug>.md` 的地方，都应理解为「报告目录 / `<slug>.md`」。
 
 ## 目录结构
 
@@ -10,13 +10,15 @@ paper_reader/
 ├── .claude/
 │   └── agents/
 │       ├── paper-analyst.md   # 子 agent：读 tex 源码，写阅读报告
-│       └── code-analyst.md    # 子 agent：读代码，补充报告
+│       ├── code-analyst.md    # 子 agent：读代码，补充报告
+│       └── html-presenter.md  # 子 agent：把 markdown 报告渲染成单文件 HTML 网页
 ├── sources/                   # 论文 tex 源码与代码仓库的存放地
 │   └── <slug>/                # 每篇论文一个子目录（见命名约定）
 │       ├── arxiv/             #   解压后的 tex 源码
 │       └── code/              #   （如有）git clone 来的源代码
-└── docs/
-    └── <slug>.md              # 该论文的阅读报告
+└── docs/                      # 默认的报告目录；用户可在请求中指定其它路径覆盖
+    ├── <slug>.md              # 该论文的阅读报告（markdown 原文）
+    └── <slug>.html            # 该论文阅读报告的人类可读 HTML 渲染版
 ```
 
 ### slug 命名约定
@@ -27,20 +29,23 @@ paper_reader/
 - `<arxiv_id>` 取 arxiv 编号；`<short-name>` 是方法/模型名小写、连字符分隔，不超过 4 个词。
 - 如果论文不在 arxiv 上，用 `noarxiv-<year>-<short-name>`。
 
-`sources/<slug>/` 与 `docs/<slug>.md` 用同一个 slug，便于交叉查找。
+`sources/<slug>/` 与报告文件（默认 `docs/<slug>.md`，或用户指定目录下的 `<slug>.md`）用同一个 slug，便于交叉查找。
 
 ## 主线 agent 工作流
 
 用户会发给你一篇论文的 **题目 / 方法名 / 链接** 中的任意一种。你的职责是按下面的步骤把整条流水线跑完。
+
+在开始前先确定本次的 **报告目录**：默认 `docs/`；如果用户在请求里显式给了另一个目录（支持相对路径或 `~` 开头的家目录路径），用那个目录替代默认值，并在派发子 agent 时把「报告路径 = 报告目录 / `<slug>.md`」完整传下去。如果该目录不存在，用 `Bash` 先 `mkdir -p` 建好。
 
 ### 第 1 步：定位并下载论文
 
 1. 如果用户给的是 arxiv 链接（含 `arxiv.org/abs/...` 或 `arxiv.org/pdf/...`），直接从中提取 arxiv id。
 2. 否则用 `WebSearch` 检索论文标题或方法名，找到对应的 arxiv abstract 页（优先 `arxiv.org/abs/...`）。如果出现多个候选，挑选作者/年份/方法名最匹配的一篇，并把判断依据短暂记录到主线对话里。
 3. 用 `WebFetch` 拉取 arxiv abstract 页，从中抽出：题目、作者列表、单位、提交日期、abstract、PDF 链接、e-print（tex 源码）链接。
-4. 用 `WebFetch` 或 `Bash`（`curl -L -o`）从 `https://arxiv.org/e-print/<arxiv_id>` 下载 tex 源码 tarball；放到 `sources/<slug>/arxiv.tar.gz`，解压到 `sources/<slug>/arxiv/` 后删除压缩包。注意 arxiv 的 e-print 通常没有扩展名，先用 `file` 命令判断真实格式（tar.gz / gzip 单文件 / zip / pdf）再选择对应的解压方式。
-5. 在 `sources/<slug>/arxiv/` 下确认能找到 `.tex` 文件；找出主文件（含 `\documentclass`，且包含 `\begin{document}`）记录路径，方便子 agent 直接定位入口。
-6. 顺手到 abstract 页和正文里扫一眼有没有公开代码（GitHub / GitLab / project page 链接）。如果有，用 `git clone --depth 1` 拉到 `sources/<slug>/code/`；克隆失败也不要中断流程，只需记下原因。
+4. **查重预检**：拿到 arxiv_id 与标题/方法名后，先按 slug 命名约定推导出本次的 slug，并用 `Glob` 在报告目录下检查是否已有这篇论文的报告——优先按 arxiv_id 前缀匹配（如 `<报告目录>/<arxiv_id>-*.md`），非 arxiv 论文则匹配 `noarxiv-<year>-*-<short-name>*.md` 或同标题/短名的文件。若命中已有报告，**立即停止执行后续下载、派发子 agent 等步骤**，直接告知用户：报告已存在于哪个路径、对应的论文题目，询问是否要强制重跑（需要用户明确确认后才能继续，并在重跑前先备份或覆盖旧文件）。
+5. 用 `WebFetch` 或 `Bash`（`curl -L -o`）从 `https://arxiv.org/e-print/<arxiv_id>` 下载 tex 源码 tarball；放到 `sources/<slug>/arxiv.tar.gz`，解压到 `sources/<slug>/arxiv/` 后删除压缩包。注意 arxiv 的 e-print 通常没有扩展名，先用 `file` 命令判断真实格式（tar.gz / gzip 单文件 / zip / pdf）再选择对应的解压方式。
+6. 在 `sources/<slug>/arxiv/` 下确认能找到 `.tex` 文件；找出主文件（含 `\documentclass`，且包含 `\begin{document}`）记录路径，方便子 agent 直接定位入口。
+7. 顺手到 abstract 页和正文里扫一眼有没有公开代码（GitHub / GitLab / project page 链接）。如果有，用 `git clone --depth 1` 拉到 `sources/<slug>/code/`；克隆失败也不要中断流程，只需记下原因。
 
 如果上面的任意一步失败（找不到 arxiv 页、tex 源码不可下载、压缩包损坏等），先尝试一次替代方案（如换关键词搜索、改用 PDF 兜底），仍失败则停下来向用户说明卡在哪一步、需要什么信息。
 
@@ -50,34 +55,49 @@ paper_reader/
 
 - slug、`sources/<slug>/arxiv/` 路径、主 tex 文件路径
 - 已经从 abstract 页拿到的元数据（题目、作者、单位、提交日期、arxiv 链接），让子 agent 不必重复抓取
-- 报告要写到 `docs/<slug>.md`
+- 报告要写到本次确定的报告路径（默认 `docs/<slug>.md`，若用户指定了其它目录则为 `<报告目录>/<slug>.md`，请写完整路径）
 - 把 `.claude/agents/paper-analyst.md` 中规定的报告结构作为硬性要求重述一遍，避免子 agent 漏写小节
 
-paper-analyst 子 agent 会在内部完成阅读 + 批判性分析（包括上网查相关论文），最后把完整报告写入 `docs/<slug>.md`。
+paper-analyst 子 agent 会在内部完成阅读 + 批判性分析（包括上网查相关论文），最后把完整报告写入你传给它的报告路径。
 
 ### 第 3 步：（如果有代码）派发 code-analyst 子 agent
 
 仅当 `sources/<slug>/code/` 存在且非空时执行。调用 `Agent` 工具，`subagent_type` 用 `code-analyst`，任务里告诉它：
 
-- slug、`sources/<slug>/code/` 路径、`docs/<slug>.md` 路径
+- slug、`sources/<slug>/code/` 路径、本次的报告路径（和第 2 步传给 paper-analyst 的是同一个文件）
 - 已有的报告已经写完了主体内容，它的工作是 **在原报告基础上补充/订正方法实现细节**，而不是重写
 - 重点关注：模型实现是否与论文描述一致、有没有论文里没说的工程 trick、训练/推理脚本暴露出的真实算力规模、license 与可复现性
 
-code-analyst 子 agent 会直接编辑 `docs/<slug>.md`，把代码层面的发现追加到「方法细节」与一个新增的「代码实现观察」小节里。
+code-analyst 子 agent 会直接编辑这份报告文件，把代码层面的发现追加到「方法细节」与一个新增的「代码实现观察」小节里。
 
-### 第 4 步：交付
+### 第 4 步：派发 html-presenter 子 agent
+
+在 markdown 报告（含可能的「代码实现观察」一节）已经稳定下来之后执行——也就是说，如果跑了第 3 步，要等它收尾再做这一步。调用 `Agent` 工具，`subagent_type` 用 `html-presenter`，任务里告诉它：
+
+- slug
+- `report_md_path`：刚刚写好的 markdown 报告路径
+- `report_html_path`：与 markdown 同目录、同 slug、扩展名换成 `.html` 的目标路径（默认 `docs/<slug>.html`，自定义报告目录下则是 `<报告目录>/<slug>.html`）
+- 论文的简要背景（题目、arxiv 链接、代码仓库链接（如有）），让它直接拿来填到 HTML 顶部 hero 区
+- 它的任务是 **基于 markdown 生成一个独立、单文件的人类可读 HTML 网页**：含 KaTeX 公式渲染、代码高亮、可折叠章节、内容脑图（Markmap、左根右叶布局，作为论文内容安排的概括性视觉摘要，不是 TOC）、低饱和配色、自然链接嵌入；不能改写报告事实内容、不能丢章节
+
+html-presenter 子 agent 会创建 `<report_html_path>` 单文件 HTML，所有 CSS / JS / 字体走 CDN，不会往仓库里塞额外静态资源。
+
+如果 markdown 报告因为某些原因没写出来（例如第 2 步失败），跳过这一步并在第 5 步如实告知用户。
+
+### 第 5 步：交付
 
 向用户简要汇报：
 - 论文题目与 slug
-- `docs/<slug>.md` 的相对路径
+- markdown 报告文件的相对路径（默认 `docs/<slug>.md`，若用户指定了其它目录则给出那个目录下的实际路径）
+- HTML 报告文件的相对路径（默认 `docs/<slug>.html`，与 markdown 同目录）
 - 是否处理了源代码
-- 任何卡点或需要用户复核的地方（例如 arxiv 上找到了多个版本、某些图无法解析等）
+- 任何卡点或需要用户复核的地方（例如 arxiv 上找到了多个版本、某些图无法解析、HTML 生成时遇到的异常等）
 
-不要把整份报告复制到对话里，让用户自己打开 markdown 文件即可。
+不要把整份报告内容复制到对话里，让用户自己打开 markdown 或 HTML 文件即可。
 
 ## 报告结构与写作要求（硬性）
 
-`docs/<slug>.md` 必须包含下列小节，**用中文撰写为主，关键术语保留英文原词**（如 attention、in-context learning、KV cache 等）。子 agent 会按这一节生成正文，主线 agent 在派发任务时也要把这一节作为契约重述。
+报告文件（默认 `docs/<slug>.md`，或用户指定目录下的 `<slug>.md`）必须包含下列小节，**用中文撰写为主，关键术语保留英文原词**（如 attention、in-context learning、KV cache 等）。子 agent 会按这一节生成正文，主线 agent 在派发任务时也要把这一节作为契约重述。
 
 1. **基本情况**：题目（中英对照）、作者、单位、arxiv 编号与提交日期、arxiv 链接、（如有）代码仓库链接。
 2. **核心贡献概述**：1–2 句专业表述。同时给出中文版本和英文版本，**英文版本尽量摘自原文**（abstract / introduction / conclusion 中的原句），并标注出处段落。
